@@ -1,0 +1,51 @@
+services:
+  user-service:
+    build:
+      context: ./services/user
+      dockerfile: Dockerfile
+    ports:
+      - "50051:50051"
+    environment:
+      - PORT=50051
+
+  greeter-service:
+    build:
+      context: ./services/greeter
+      dockerfile: Dockerfile
+    ports:
+      - "50052:50052"
+    environment:
+      - PORT=50052
+
+  auth-service:
+    build:
+      context: ./services/auth
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      - PORT=8081
+
+  envoy:
+    image: envoyproxy/envoy:v1.31-latest
+    ports:
+      - "8080:8080"
+      - "9901:9901"
+    volumes:
+      - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+      - ./envoy/filters:/etc/envoy/filters:ro
+    depends_on:
+      - user-service
+      - greeter-service
+      - auth-service
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_ENVOY_URL=http://localhost:8080
+    depends_on:
+      - envoy

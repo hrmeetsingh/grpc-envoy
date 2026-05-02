@@ -1,0 +1,10 @@
+version: v2
+modules:
+  - path: user/v1
+  - path: greeter/v1
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE

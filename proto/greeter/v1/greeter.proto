@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package greeter.v1;
+
+option go_package = "github.com/harmeetsingh/grpc-envoy/services/greeter/internal/adapter/grpcserver/pb";
+
+service GreeterService {
+  rpc SayHello(SayHelloRequest) returns (SayHelloResponse);
+  rpc SayGoodbye(SayGoodbyeRequest) returns (SayGoodbyeResponse);
+}
+
+message SayHelloRequest {
+  string name = 1;
+}
+
+message SayHelloResponse {
+  string message = 1;
+}
+
+message SayGoodbyeRequest {
+  string name = 1;
+}
+
+message SayGoodbyeResponse {
+  string message = 1;
+}
