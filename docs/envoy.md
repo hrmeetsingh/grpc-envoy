@@ -2,19 +2,18 @@
 
 ## The Problem
 
-Browsers cannot speak native gRPC. gRPC uses HTTP/2 with binary protobuf framing, trailers, and bidirectional streaming — features that browser `fetch`/`XMLHttpRequest` APIs don't support directly.
+Browsers cannot speak native gRPC. gRPC uses HTTP/2 with protobuf framing, trailers, and streaming semantics that typical browser APIs do not expose cleanly. This project also routes **HTTP login** and **gRPC** through one listener and enforces **JWT tenant vs subdomain** before upstream gRPC.
 
-## The Solution: grpc-web
+## grpc-web and Envoy
 
-The [grpc-web](https://github.com/grpc/grpc-web) protocol is a browser-compatible variant of gRPC. It wraps protobuf payloads in a slightly different framing that works over HTTP/1.1. A proxy sits between the browser and the gRPC server, translating between grpc-web (HTTP/1.1) and native gRPC (HTTP/2).
+The [grpc-web](https://github.com/grpc/grpc-web) protocol carries protobuf payloads over HTTP in a form browsers can use. Envoy sits between the browser and Go gRPC servers and translates grpc-web (HTTP/1.1 as seen on the client side) to native gRPC (HTTP/2) upstream.
 
-Envoy is the officially recommended proxy for this translation.
+## Configuration Location
 
-## How Envoy Is Configured
+- Main config: `envoy/envoy.yaml`
+- Lua tenant script (mounted in Docker): `envoy/filters/tenant_check.lua`
 
-The configuration lives in `envoy/envoy.yaml`. Here's a breakdown of each major section:
-
-### Admin Interface
+## Admin Interface
 
 ```yaml
 admin:
@@ -24,32 +23,27 @@ admin:
       port_value: 9901
 ```
 
-Exposes Envoy's built-in admin dashboard at `http://localhost:9901`. Useful for inspecting clusters, routes, stats, and config dumps during development.
+Dashboard: `http://localhost:9901` (clusters, routes, stats).
 
-### Listener
+## Listener
 
-```yaml
-listeners:
-  - name: listener_0
-    address:
-      socket_address:
-        address: 0.0.0.0
-        port_value: 8080
-```
+Envoy listens on **0.0.0.0:8080** for all traffic from the browser and for curl tests against `localhost:8080`.
 
-Envoy listens on port 8080 for incoming HTTP requests from the browser.
+## HTTP Connection Manager
 
-### HTTP Connection Manager
+- **codec_type: AUTO** — HTTP/1.1 or HTTP/2 on the downstream connection.
+- **route_config** — path-prefix routes to `auth_service`, `user_service`, or `greeter_service`.
 
-The listener uses the `http_connection_manager` network filter, which handles HTTP-level processing:
+## Routing
 
-- **codec_type: AUTO** — auto-detect HTTP/1.1 or HTTP/2
-- **route_config** — defines how incoming requests are routed to upstream gRPC clusters
-
-### Routing
+Routes are **order-sensitive** (first match wins):
 
 ```yaml
 routes:
+  - match:
+      prefix: "/auth/"
+    route:
+      cluster: auth_service
   - match:
       prefix: "/user.v1.UserService"
     route:
@@ -60,98 +54,101 @@ routes:
       cluster: greeter_service
 ```
 
-gRPC requests use the path format `/<package>.<Service>/<Method>`. Envoy matches on the service prefix and forwards to the correct upstream cluster.
+- **Auth** — JSON login and any path under `/auth/` goes to Go **AuthService** on port **8081** (plain HTTP).
+- **gRPC** — paths follow `/<package>.<Service>/<Method>`; clusters use **HTTP/2** upstream.
 
-### HTTP Filters (the key part)
+## HTTP Filters
 
-Three filters execute in order on every request:
+Execution order (request path):
 
-1. **`grpc_web`** — Translates between grpc-web wire format (what the browser sends) and standard gRPC (what the Go servers expect). This is the core filter that makes browser-to-gRPC possible.
+1. **`envoy.filters.http.grpc_web`** — grpc-web to native gRPC toward upstream (login traffic is plain HTTP; filter still runs but routing targets HTTP/1 auth cluster).
+2. **`envoy.filters.http.cors`** — Adds CORS headers per virtual host (`cors` block on the route table).
+3. **`envoy.filters.http.lua`** — Loads `default_source_code.filename: /etc/envoy/filters/tenant_check.lua`. For paths **not** starting with `/auth/`, requires `Authorization: Bearer`, decodes JWT payload enough to read `tenant`, compares with subdomain from `:authority`; responds **401** or **403** on failure; **skips** checks for `/auth/*` so login works without a prior token.
+4. **`envoy.filters.http.router`** — Selects cluster from route config.
 
-2. **`cors`** — Handles Cross-Origin Resource Sharing. The browser's frontend (port 3000) makes requests to Envoy (port 8080), which is a different origin. Without CORS headers, the browser would block the request.
+In Docker Compose, `./envoy/filters` is mounted at `/etc/envoy/filters` so the Lua file can be edited without baking it into an image layer as inline YAML.
 
-3. **`router`** — The standard Envoy HTTP router that forwards requests to upstream clusters based on the route config.
-
-### CORS Configuration
+### CORS
 
 ```yaml
 cors:
   allow_origin_string_match:
     - prefix: "*"
   allow_methods: GET, PUT, DELETE, POST, OPTIONS
-  allow_headers: keep-alive,user-agent,cache-control,content-type,...,x-grpc-web,grpc-timeout
-  expose_headers: grpc-status,grpc-message
+  allow_headers: ... ,x-grpc-web,grpc-timeout,authorization
 ```
 
-- `allow_origin_string_match: *` — accepts requests from any origin (fine for development)
-- `allow_headers` — must include `x-grpc-web`, `content-type`, and `grpc-timeout` for grpc-web to work
-- `expose_headers` — exposes `grpc-status` and `grpc-message` so the browser client can read gRPC error details
+- **`authorization`** — required so browsers can send `Bearer` tokens after login.
+- **grpc-web** — still needs `x-grpc-web`, `content-type`, `grpc-timeout` as before.
 
-### Upstream Clusters
+## Upstream Clusters
+
+**User and Greeter** (gRPC):
 
 ```yaml
 clusters:
   - name: user_service
-    type: LOGICAL_DNS
     typed_extension_protocol_options:
       envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
         explicit_http_config:
           http2_protocol_options: {}
+```
+
+- **`http2_protocol_options`** — Required for native gRPC to Go servers.
+
+**Auth** (HTTP only):
+
+```yaml
+clusters:
+  - name: auth_service
     load_assignment:
       endpoints:
         - lb_endpoints:
             - endpoint:
                 address:
                   socket_address:
-                    address: user-service
-                    port_value: 50051
+                    address: auth-service
+                    port_value: 8081
 ```
 
-Each cluster defines one upstream gRPC service:
+No `http2_protocol_options`: auth speaks normal HTTP/1.1.
 
-- **type: LOGICAL_DNS** — resolves hostnames via DNS (docker-compose service names work here)
-- **http2_protocol_options** — forces HTTP/2 to the upstream, which gRPC requires
-- **address** — the docker-compose service name (`user-service` or `greeter-service`)
+- **LOGICAL_DNS** — docker-compose DNS names (`user-service`, `greeter-service`, `auth-service`).
 
-## Request Flow Diagram
+## Request Flow Diagrams
+
+### Login (`POST /auth/login`)
 
 ```
-Browser (port 3000)
-    │
-    │  HTTP/1.1 POST /user.v1.UserService/CreateUser
-    │  Content-Type: application/grpc-web+proto
-    │  X-Grpc-Web: 1
-    │
-    ▼
-Envoy (port 8080)
-    │
-    │  [grpc_web filter] strips grpc-web framing, converts to gRPC
-    │  [cors filter] adds Access-Control-Allow-* headers
-    │  [router] matches prefix → user_service cluster
-    │
-    │  HTTP/2 POST /user.v1.UserService/CreateUser
-    │  Content-Type: application/grpc
-    │
-    ▼
-UserService (port 50051)
-    │
-    │  Processes request, returns protobuf response
-    │
-    ▼
-Envoy
-    │
-    │  [grpc_web filter] re-frames response for browser
-    │
-    ▼
-Browser
-    │
-    │  grpc-web client deserializes protobuf → JavaScript object
+Browser or curl → Envoy :8080
+  Host: tenant.example.com
+  Path /auth/login
+    → grpc_web (no-op for JSON body upstream)
+    → cors
+    → lua (skip — path /auth/)
+    → router → auth_service :8081
+    → JSON { "token": "..." }
 ```
+
+### gRPC call (after login)
+
+```
+Browser → Envoy :8080
+  Authorization: Bearer <JWT>
+  Path /user.v1.UserService/CreateUser
+    → grpc_web (grpc-web → gRPC)
+    → cors
+    → lua (tenant vs Host subdomain; fail fast 401/403)
+    → router → user_service :50051
+    → HTTP/2 gRPC to Go UserService
+```
+
+Response path mirrors filters in reverse order; grpc_web reframes grpc-web for the browser where applicable.
 
 ## Key Takeaways
 
-1. **Envoy is a transparent bridge** — your Go services don't know or care that the client is a browser. They receive standard gRPC requests.
-2. **The grpc_web filter does the heavy lifting** — it translates between HTTP/1.1 grpc-web format and HTTP/2 native gRPC.
-3. **CORS is required** — browser security model requires explicit permission for cross-origin requests.
-4. **HTTP/2 to upstream is mandatory** — gRPC requires HTTP/2, so `http2_protocol_options` must be set on every gRPC cluster.
-5. **Routing uses gRPC path convention** — `/<package>.<Service>/<Method>`, and Envoy matches on the service prefix.
+1. **One listener** multiplexes REST login and gRPC by **path prefix**.
+2. **`grpc_web`** bridges browser grpc-web and upstream gRPC (**HTTP/2** to user/greeter).
+3. **Lua** enforces **tenant ⊂ JWT** aligns with **`Host` subdomain** for all non-login HTTP requests that reach the filter chain (including grpc-web-encoded calls).
+4. **CORS** must allow **`authorization`** header for Bearer tokens.
+5. **auth_service cluster** stays **HTTP/1**; **gRPC clusters** require **HTTP/2** upstream options.

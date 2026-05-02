@@ -310,3 +310,19 @@ Refactored for maintainability: Lua filter lives in its own file for easier edit
 
 ### Test status
 - 30 passing / 30 total
+
+## v15 - Docs Sync (architecture + envoy) - 2026-05-02T07:40
+
+### What changed
+- `docs/architecture.md`: Diagram includes AuthService, Envoy filter stack, tenant Lua note; hex section documents `services/auth` adapters; services table adds AuthService; split data-flow into gRPC-through-Envoy vs login paths; clarified hand-maintained grpc-web stubs wording
+- `docs/envoy.md`: Documented `/auth/` routing, four HTTP filters including Lua + `tenant_check.lua`, CORS `authorization`, `auth_service` cluster without HTTP/2, separate login vs gRPC request-flow diagrams
+
+### Files touched
+- `docs/architecture.md`
+- `docs/envoy.md`
+
+### Test status
+- unchanged (documentation only)
+
+### Summary
+Architecture and Envoy docs aligned with CHANGELOG v11–v13: auth-service, subdomain JWT enforcement Lua script, clusters, and filter order.
